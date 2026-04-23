@@ -62,33 +62,37 @@ void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
 void Init_TOF_Sensors(void);
-void Read_TOF_Sensors(uint16_t distances[4]);
+void Read_TOF_Sensors(uint16_t distances[2]);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define VL53L0X_DEFAULT_ADDRESS 0x52  // default 8-bit address for 7-bit 0x29
-#define VL53L0X_ADDRESS_1       0x60  // 7-bit 0x30
-#define VL53L0X_ADDRESS_2       0x62  // 7-bit 0x31
-#define VL53L0X_ADDRESS_3       0x64  // 7-bit 0x32
-#define VL53L0X_ADDRESS_4       0x66  // 7-bit 0x33
+#define VL53L0X_DEFAULT_ADDRESS 0x52  // default 8-bit address (0x29 << 1)
+#define VL53L0X_ADDRESS_1       0x60  // 8-bit address (0x30 << 1)
+#define VL53L0X_ADDRESS_2       0x62  // 8-bit address (0x31 << 1)
 
-static const uint8_t VL53L0X_Addresses[4] = {
+#define NUM_SENSORS 2
+
+static const uint8_t VL53L0X_Addresses[NUM_SENSORS] = {
     VL53L0X_ADDRESS_1,
-    VL53L0X_ADDRESS_2,
-    VL53L0X_ADDRESS_3,
-    VL53L0X_ADDRESS_4
+    VL53L0X_ADDRESS_2
 };
 
-VL53L0X_Dev_t dev[4];
-VL53L0X_DEV Dev[4] = { &dev[0], &dev[1], &dev[2], &dev[3] };
+static const uint16_t XSHUT_Pins[NUM_SENSORS] = {
+    TOFX1_Pin,
+    TOFX2_Pin
+};
+
+VL53L0X_Dev_t dev[NUM_SENSORS];
+VL53L0X_DEV Dev[NUM_SENSORS] = { &dev[0], &dev[1] };
 
 static VL53L0X_Error VL53L0X_InitOneSensor(VL53L0X_DEV device, uint8_t initialAddr, uint8_t finalAddr)
 {
     VL53L0X_Error status;
 
-    device->I2cHandle = &hi2c1;
     device->I2cDevAddr = initialAddr;
+    device->comms_type = 1;      // 1 = I2C in VL53L0X API examples
+    device->comms_speed_khz = 400;
 
     status = VL53L0X_DataInit(device);
     if (status != VL53L0X_ERROR_NONE) {
@@ -115,7 +119,15 @@ void Init_TOF_Sensors(void)
 {
     VL53L0X_Error status;
 
-    for (uint8_t i = 0; i < 4; ++i) {
+    // Disable all sensors by setting XSHUT low
+    HAL_GPIO_WritePin(GPIOD, TOFX1_Pin | TOFX2_Pin, GPIO_PIN_RESET);
+    HAL_Delay(10);  // Wait for sensors to power down
+
+    for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
+        // Enable current sensor by setting XSHUT high
+        HAL_GPIO_WritePin(GPIOD, XSHUT_Pins[i], GPIO_PIN_SET);
+        HAL_Delay(10);  // Wait for sensor to boot
+
         status = VL53L0X_InitOneSensor(Dev[i], VL53L0X_DEFAULT_ADDRESS, VL53L0X_Addresses[i]);
         if (status != VL53L0X_ERROR_NONE) {
             Error_Handler();
@@ -123,15 +135,15 @@ void Init_TOF_Sensors(void)
     }
 }
 
-void Read_TOF_Sensors(uint16_t distances[4])
+void Read_TOF_Sensors(uint16_t distances[2])
 {
     VL53L0X_RangingMeasurementData_t rangingData;
 
-    for (uint8_t i = 0; i < 4; ++i) {
+    for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
         if (VL53L0X_PerformSingleRangingMeasurement(Dev[i], &rangingData) == VL53L0X_ERROR_NONE) {
             distances[i] = rangingData.RangeMilliMeter;
         } else {
-            distances[i] = 0xFFFF;
+            distances[i] = 0xFFFF;  // Error value
         }
     }
 }
