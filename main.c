@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "usb_host.h"
-#include "vl53l0x_api.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -62,20 +61,32 @@ void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
 void Init_TOF_Sensors(void);
-void Read_TOF_Sensors(uint16_t distances[2]);
+void Read_TOF_Sensors(void);
+uint16_t Get_Sensor_Distance(uint8_t sensor_index);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define VL53L0X_DEFAULT_ADDRESS 0x52  // default 8-bit address (0x29 << 1)
-#define VL53L0X_ADDRESS_1       0x60  // 8-bit address (0x30 << 1)
-#define VL53L0X_ADDRESS_2       0x62  // 8-bit address (0x31 << 1)
+
+// VL53L0X Register Map (key registers)
+#define VL53L0X_REG_SYSRANGE_START                  0x00
+#define VL53L0X_REG_RESULT_RANGE_STATUS             0x14
+#define VL53L0X_REG_I2C_SLAVE_DEVICE_ADDRESS        0x8A
+
+#define VL53L0X_DEFAULT_ADDRESS  0x29
+#define VL53L0X_ADDRESS_1        0x30  // First sensor
+#define VL53L0X_ADDRESS_2        0x31  // Second sensor
 
 #define NUM_SENSORS 2
 
-static const uint8_t VL53L0X_Addresses[NUM_SENSORS] = {
-    VL53L0X_ADDRESS_1,
-    VL53L0X_ADDRESS_2
+typedef struct {
+    uint8_t address;        // I2C address of sensor
+    uint16_t distance_mm;   // Range in millimeters
+} TOF_Sensor_t;
+
+static TOF_Sensor_t sensors[NUM_SENSORS] = {
+    { .address = VL53L0X_ADDRESS_1, .distance_mm = 0 },
+    { .address = VL53L0X_ADDRESS_2, .distance_mm = 0 }
 };
 
 static const uint16_t XSHUT_Pins[NUM_SENSORS] = {
@@ -83,70 +94,122 @@ static const uint16_t XSHUT_Pins[NUM_SENSORS] = {
     TOFX2_Pin
 };
 
-VL53L0X_Dev_t dev[NUM_SENSORS];
-VL53L0X_DEV Dev[NUM_SENSORS] = { &dev[0], &dev[1] };
-
-static VL53L0X_Error VL53L0X_InitOneSensor(VL53L0X_DEV device, uint8_t initialAddr, uint8_t finalAddr)
+// I2C write single byte
+static HAL_StatusTypeDef VL53L0X_Write_Byte(uint8_t address, uint8_t reg, uint8_t value)
 {
-    VL53L0X_Error status;
+    uint8_t data[2] = { reg, value };
+    return HAL_I2C_Master_Transmit(&hi2c1, (address << 1), data, 2, HAL_MAX_DELAY);
+}
 
-    device->I2cDevAddr = initialAddr;
-    device->comms_type = 1;      // 1 = I2C in VL53L0X API examples
-    device->comms_speed_khz = 400;
+// I2C read single byte
+static HAL_StatusTypeDef VL53L0X_Read_Byte(uint8_t address, uint8_t reg, uint8_t *value)
+{
+    if (HAL_I2C_Master_Transmit(&hi2c1, (address << 1), &reg, 1, HAL_MAX_DELAY) != HAL_OK)
+        return HAL_ERROR;
+    return HAL_I2C_Master_Receive(&hi2c1, (address << 1), value, 1, HAL_MAX_DELAY);
+}
 
-    status = VL53L0X_DataInit(device);
-    if (status != VL53L0X_ERROR_NONE) {
-        return status;
-    }
+// I2C read 2 bytes (16-bit)
+static HAL_StatusTypeDef VL53L0X_Read_Word(uint8_t address, uint8_t reg, uint16_t *value)
+{
+    uint8_t data[2];
+    if (HAL_I2C_Master_Transmit(&hi2c1, (address << 1), &reg, 1, HAL_MAX_DELAY) != HAL_OK)
+        return HAL_ERROR;
+    if (HAL_I2C_Master_Receive(&hi2c1, (address << 1), data, 2, HAL_MAX_DELAY) != HAL_OK)
+        return HAL_ERROR;
+    *value = ((uint16_t)data[0] << 8) | data[1];
+    return HAL_OK;
+}
 
-    status = VL53L0X_StaticInit(device);
-    if (status != VL53L0X_ERROR_NONE) {
-        return status;
-    }
+// Change I2C address of sensor
+static HAL_StatusTypeDef VL53L0X_Change_Address(uint8_t old_addr, uint8_t new_addr)
+{
+    return VL53L0X_Write_Byte(old_addr, VL53L0X_REG_I2C_SLAVE_DEVICE_ADDRESS, new_addr);
+}
 
-    if (finalAddr != initialAddr) {
-        status = VL53L0X_SetDeviceAddress(device, finalAddr);
-        if (status != VL53L0X_ERROR_NONE) {
-            return status;
-        }
-        device->I2cDevAddr = finalAddr;
-    }
+// Start single ranging measurement
+static HAL_StatusTypeDef VL53L0X_Start_Ranging(uint8_t address)
+{
+    return VL53L0X_Write_Byte(address, VL53L0X_REG_SYSRANGE_START, 0x01);
+}
 
-    return VL53L0X_ERROR_NONE;
+// Check if measurement is ready
+static HAL_StatusTypeDef VL53L0X_Is_Ready(uint8_t address, uint8_t *ready)
+{
+    uint8_t status;
+    if (VL53L0X_Read_Byte(address, VL53L0X_REG_RESULT_RANGE_STATUS, &status) != HAL_OK)
+        return HAL_ERROR;
+    *ready = (status & 0x01) == 0;  // Bit 0: measurement ready when 0
+    return HAL_OK;
+}
+
+// Read distance measurement
+static HAL_StatusTypeDef VL53L0X_Read_Distance(uint8_t address, uint16_t *distance)
+{
+    uint16_t raw_distance;
+    if (VL53L0X_Read_Word(address, 0x16, &raw_distance) != HAL_OK)
+        return HAL_ERROR;
+    *distance = raw_distance;
+    return HAL_OK;
 }
 
 void Init_TOF_Sensors(void)
 {
-    VL53L0X_Error status;
-
-    // Disable all sensors by setting XSHUT low
+    // Power down all sensors first
     HAL_GPIO_WritePin(GPIOD, TOFX1_Pin | TOFX2_Pin, GPIO_PIN_RESET);
-    HAL_Delay(10);  // Wait for sensors to power down
+    HAL_Delay(50);
 
+    // Initialize each sensor sequentially
     for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
-        // Enable current sensor by setting XSHUT high
+        // Power on current sensor
         HAL_GPIO_WritePin(GPIOD, XSHUT_Pins[i], GPIO_PIN_SET);
-        HAL_Delay(10);  // Wait for sensor to boot
+        HAL_Delay(50);  // Wait for sensor to boot
 
-        status = VL53L0X_InitOneSensor(Dev[i], VL53L0X_DEFAULT_ADDRESS, VL53L0X_Addresses[i]);
-        if (status != VL53L0X_ERROR_NONE) {
+        // Change address from default to unique address
+        if (VL53L0X_Change_Address(VL53L0X_DEFAULT_ADDRESS, sensors[i].address) != HAL_OK) {
             Error_Handler();
         }
+        HAL_Delay(10);
     }
+
+    // All sensors now have unique addresses and are powered on
 }
 
-void Read_TOF_Sensors(uint16_t distances[2])
+void Read_TOF_Sensors(void)
 {
-    VL53L0X_RangingMeasurementData_t rangingData;
+    uint8_t ready;
+    uint16_t distance;
 
     for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
-        if (VL53L0X_PerformSingleRangingMeasurement(Dev[i], &rangingData) == VL53L0X_ERROR_NONE) {
-            distances[i] = rangingData.RangeMilliMeter;
+        // Start measurement
+        if (VL53L0X_Start_Ranging(sensors[i].address) != HAL_OK)
+            continue;
+
+        // Wait for measurement ready (with timeout)
+        uint32_t timeout = HAL_GetTick() + 100;  // 100ms timeout
+        while (HAL_GetTick() < timeout) {
+            if (VL53L0X_Is_Ready(sensors[i].address, &ready) == HAL_OK && ready) {
+                break;
+            }
+            HAL_Delay(5);
+        }
+
+        // Read distance
+        if (VL53L0X_Read_Distance(sensors[i].address, &distance) == HAL_OK) {
+            sensors[i].distance_mm = distance;
         } else {
-            distances[i] = 0xFFFF;  // Error value
+            sensors[i].distance_mm = 0xFFFF;  // Error value
         }
     }
 }
+
+uint16_t Get_Sensor_Distance(uint8_t sensor_index)
+{
+    if (sensor_index < NUM_SENSORS)
+        return sensors[sensor_index].distance_mm;
+    return 0xFFFF;
+}
+
 /* USER CODE END 0 */
 
 /**
