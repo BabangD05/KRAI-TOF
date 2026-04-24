@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "vl53l0x_api.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,15 +43,16 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c3;
 
 I2S_HandleTypeDef hi2s3;
 
 SPI_HandleTypeDef hspi1;
 
-UART_HandleTypeDef huart1;
-
 /* USER CODE BEGIN PV */
-
+VL53L0X_RangingMeasurementData_t RangingData;
+VL53L0X_Dev_t  vl53l0x_c;
+VL53L0X_DEV Dev = &vl53l0x_c;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -59,177 +61,35 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_I2C3_Init(void);
 void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
-void Init_TOF_Sensors(void);
-void Read_TOF_Sensors(void);
-uint16_t Get_Sensor_Distance(uint8_t sensor_index);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void LidarInit() {
+	uint32_t refSpadCount;
+	uint8_t isApertureSpads;
+	uint8_t VhvSettings;
+	uint8_t PhaseCal;
+	VL53L0X_WaitDeviceBooted( Dev );
+	VL53L0X_DataInit( Dev );
+	VL53L0X_StaticInit( Dev );
+	VL53L0X_PerformRefCalibration(Dev, &VhvSettings, &PhaseCal);
+	VL53L0X_PerformRefSpadManagement(Dev, &refSpadCount, &isApertureSpads);
+	VL53L0X_SetDeviceMode(Dev, VL53L0X_DEVICEMODE_SINGLE_RANGING);
 
-// VL53L0X Register Map (key registers)
-#define VL53L0X_REG_SYSRANGE_START                  0x00
-#define VL53L0X_REG_RESULT_RANGE_STATUS             0x14
-#define VL53L0X_REG_I2C_SLAVE_DEVICE_ADDRESS        0x8A
-
-#define VL53L0X_DEFAULT_ADDRESS  0x29
-#define VL53L0X_ADDRESS_1        0x30  // First sensor
-#define VL53L0X_ADDRESS_2        0x31  // Second sensor
-
-#define NUM_SENSORS 2
-
-typedef struct {
-    uint8_t address;        // I2C address of sensor
-    uint16_t distance_mm;   // Range in millimeters
-} TOF_Sensor_t;
-
-static TOF_Sensor_t sensors[NUM_SENSORS] = {
-    { .address = VL53L0X_ADDRESS_1, .distance_mm = 0 },
-    { .address = VL53L0X_ADDRESS_2, .distance_mm = 0 }
-};
-
-static const uint16_t XSHUT_Pins[NUM_SENSORS] = {
-    TOFX1_Pin,
-    TOFX2_Pin
-};
-
-// I2C write single byte
-static HAL_StatusTypeDef VL53L0X_Write_Byte(uint8_t address, uint8_t reg, uint8_t value)
-{
-    uint8_t data[2] = { reg, value };
-    return HAL_I2C_Master_Transmit(&hi2c1, (address << 1), data, 2, HAL_MAX_DELAY);
+	VL53L0X_SetLimitCheckEnable(Dev, VL53L0X_CHECKENABLE_SIGMA_FINAL_RANGE, 1);
+	VL53L0X_SetLimitCheckEnable(Dev, VL53L0X_CHECKENABLE_SIGNAL_RATE_FINAL_RANGE, 1);
+	VL53L0X_SetLimitCheckValue(Dev, VL53L0X_CHECKENABLE_SIGNAL_RATE_FINAL_RANGE, (FixPoint1616_t)(0.1*65536));
+	VL53L0X_SetLimitCheckValue(Dev, VL53L0X_CHECKENABLE_SIGMA_FINAL_RANGE, (FixPoint1616_t)(60*65536));
+	VL53L0X_SetMeasurementTimingBudgetMicroSeconds(Dev, 33000);
+	VL53L0X_SetVcselPulsePeriod(Dev, VL53L0X_VCSEL_PERIOD_PRE_RANGE, 18);
+	VL53L0X_SetVcselPulsePeriod(Dev, VL53L0X_VCSEL_PERIOD_FINAL_RANGE, 14);
 }
-
-// I2C read single byte
-static HAL_StatusTypeDef VL53L0X_Read_Byte(uint8_t address, uint8_t reg, uint8_t *value)
-{
-    if (HAL_I2C_Master_Transmit(&hi2c1, (address << 1), &reg, 1, HAL_MAX_DELAY) != HAL_OK)
-        return HAL_ERROR;
-    return HAL_I2C_Master_Receive(&hi2c1, (address << 1), value, 1, HAL_MAX_DELAY);
-}
-
-// I2C read 2 bytes (16-bit)
-static HAL_StatusTypeDef VL53L0X_Read_Word(uint8_t address, uint8_t reg, uint16_t *value)
-{
-    uint8_t data[2];
-    if (HAL_I2C_Master_Transmit(&hi2c1, (address << 1), &reg, 1, HAL_MAX_DELAY) != HAL_OK)
-        return HAL_ERROR;
-    if (HAL_I2C_Master_Receive(&hi2c1, (address << 1), data, 2, HAL_MAX_DELAY) != HAL_OK)
-        return HAL_ERROR;
-    *value = ((uint16_t)data[0] << 8) | data[1];
-    return HAL_OK;
-}
-
-// Change I2C address of sensor
-static HAL_StatusTypeDef VL53L0X_Change_Address(uint8_t old_addr, uint8_t new_addr)
-{
-    return VL53L0X_Write_Byte(old_addr, VL53L0X_REG_I2C_SLAVE_DEVICE_ADDRESS, new_addr);
-}
-
-// Start single ranging measurement
-static HAL_StatusTypeDef VL53L0X_Start_Ranging(uint8_t address)
-{
-    return VL53L0X_Write_Byte(address, VL53L0X_REG_SYSRANGE_START, 0x01);
-}
-
-// Check if measurement is ready
-static HAL_StatusTypeDef VL53L0X_Is_Ready(uint8_t address, uint8_t *ready)
-{
-    uint8_t status;
-    if (VL53L0X_Read_Byte(address, VL53L0X_REG_RESULT_RANGE_STATUS, &status) != HAL_OK)
-        return HAL_ERROR;
-    *ready = (status & 0x01) == 0;  // Bit 0: measurement ready when 0
-    return HAL_OK;
-}
-
-// Read distance measurement
-static HAL_StatusTypeDef VL53L0X_Read_Distance(uint8_t address, uint16_t *distance)
-{
-    uint16_t raw_distance;
-    if (VL53L0X_Read_Word(address, 0x16, &raw_distance) != HAL_OK)
-        return HAL_ERROR;
-    *distance = raw_distance;
-    return HAL_OK;
-}
-
-void Init_TOF_Sensors(void)
-{
-    // Power down all sensors first
-    HAL_GPIO_WritePin(GPIOD, TOFX1_Pin | TOFX2_Pin, GPIO_PIN_RESET);
-    HAL_Delay(50);
-
-    // Initialize each sensor sequentially
-    for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
-        // Power on current sensor
-        HAL_GPIO_WritePin(GPIOD, XSHUT_Pins[i], GPIO_PIN_SET);
-        HAL_Delay(50);  // Wait for sensor to boot
-
-        // Change address from default to unique address
-        if (VL53L0X_Change_Address(VL53L0X_DEFAULT_ADDRESS, sensors[i].address) != HAL_OK) {
-            Error_Handler();
-        }
-        HAL_Delay(10);
-    }
-
-    // All sensors now have unique addresses and are powered on
-}
-
-void Read_TOF_Sensors(void)
-{
-    uint8_t ready;
-    uint16_t distance;
-
-    for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
-        // Start measurement
-        if (VL53L0X_Start_Ranging(sensors[i].address) != HAL_OK)
-            continue;
-
-        // Wait for measurement ready (with timeout)
-        uint32_t timeout = HAL_GetTick() + 100;  // 100ms timeout
-        while (HAL_GetTick() < timeout) {
-            if (VL53L0X_Is_Ready(sensors[i].address, &ready) == HAL_OK && ready) {
-                break;
-            }
-            HAL_Delay(5);
-        }
-
-        // Read distance
-        if (VL53L0X_Read_Distance(sensors[i].address, &distance) == HAL_OK) {
-            sensors[i].distance_mm = distance;
-        } else {
-            sensors[i].distance_mm = 0xFFFF;  // Error value
-        }
-    }
-}
-
-uint16_t Get_Sensor_Distance(uint8_t sensor_index)
-{
-    if (sensor_index < NUM_SENSORS)
-        return sensors[sensor_index].distance_mm;
-    return 0xFFFF;
-}
-
-void Print_TOF_Readings(void)
-{
-    printf("\r\n--- TOF Sensor Readings ---\r\n");
-    for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
-        if (sensors[i].distance_mm == 0xFFFF) {
-            printf("Sensor %d (0x%02X): ERROR\r\n", i + 1, sensors[i].address);
-        } else {
-            printf("Sensor %d (0x%02X): %u mm\r\n", i + 1, sensors[i].address, sensors[i].distance_mm);
-        }
-    }
-}
-
-int _write(int file, char *ptr, int len)
-{
-    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
-    return len;
-}
-
 /* USER CODE END 0 */
 
 /**
@@ -265,22 +125,30 @@ int main(void)
   MX_I2S3_Init();
   MX_SPI1_Init();
   MX_USB_HOST_Init();
+  MX_I2C3_Init();
   /* USER CODE BEGIN 2 */
-  Init_TOF_Sensors();
+  Dev->I2cHandle = &hi2c3;
+  Dev->I2cDevAddr = 0x52;
+
+        HAL_GPIO_WritePin(TOFX1_GPIO_Port, TOFX1_Pin, GPIO_PIN_RESET);
+        HAL_Delay(20);
+        HAL_GPIO_WritePin(TOFX1_GPIO_Port, TOFX1_Pin, GPIO_PIN_SET);
+        HAL_Delay(20);
+        LidarInit();
+        VL53L0X_SetDeviceAddress(Dev, 0x62);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
+	  	  Dev->I2cDevAddr = 0x62;
+	  	  VL53L0X_PerformSingleRangingMeasurement(Dev, &RangingData);
     /* USER CODE END WHILE */
     MX_USB_HOST_Process();
 
     /* USER CODE BEGIN 3 */
-    Read_TOF_Sensors();
-    Print_TOF_Readings();
-    HAL_Delay(500);
+
   }
   /* USER CODE END 3 */
 }
@@ -361,6 +229,40 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief I2C3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C3_Init(void)
+{
+
+  /* USER CODE BEGIN I2C3_Init 0 */
+
+  /* USER CODE END I2C3_Init 0 */
+
+  /* USER CODE BEGIN I2C3_Init 1 */
+
+  /* USER CODE END I2C3_Init 1 */
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.ClockSpeed = 100000;
+  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C3_Init 2 */
+
+  /* USER CODE END I2C3_Init 2 */
 
 }
 
@@ -519,22 +421,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PC9 */
-  GPIO_InitStruct.Pin = GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF4_I2C3;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PA8 */
-  GPIO_InitStruct.Pin = GPIO_PIN_8;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF4_I2C3;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
   GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
